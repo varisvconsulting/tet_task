@@ -1,0 +1,153 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    name: Test Kubernetes deployment
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start Minikube
+        uses: medyagh/setup-minikube@latest
+
+      - name: Enable Ingress
+        run: |
+          minikube addons enable ingress
+
+          kubectl rollout status \
+            deployment/ingress-nginx-controller \
+            -n ingress-nginx \
+            --timeout=180s
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t tet_task:latest \
+            ./docker_site
+
+      - name: Load image into Minikube
+        run: |
+          minikube image load tet_task:latest
+
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f site.k8s
+
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status \
+            deployment/site-demo \
+            --timeout=120s
+
+      - name: Wait for service endpoint
+        run: |
+          echo "Waiting for site-demo endpoint..."
+
+          for i in {1..60}; do
+            ENDPOINTS=$(kubectl get endpoints site-demo \
+              -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+
+            if [ -n "$ENDPOINTS" ]; then
+              echo "Service endpoint available: $ENDPOINTS"
+              break
+            fi
+
+            echo "No endpoint yet..."
+            sleep 2
+          done
+
+          if [ -z "$ENDPOINTS" ]; then
+            echo "ERROR: Service never received an endpoint"
+            kubectl get endpoints site-demo -o yaml
+            exit 1
+          fi
+
+      - name: Test application
+        run: |
+          MINIKUBE_IP=$(minikube ip)
+
+          for i in {1..30}; do
+            echo "Attempt $i..."
+
+            HTTP_CODE=$(curl \
+              --silent \
+              --output /tmp/response.txt \
+              --write-out "%{http_code}" \
+              -H "Host: site.local" \
+              "http://$MINIKUBE_IP/" || true)
+
+            echo "HTTP status: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Application is responding!"
+              cat /tmp/response.txt
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "Application never returned HTTP 200"
+          cat /tmp/response.txt
+          exit 1
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -o wide
+          kubectl get deployments
+          kubectl get services
+          kubectl get ingress
+          kubectl get endpoints site-demo
+          kubectl get events --sort-by='.lastTimestamp'
+
+          kubectl describe pods
+
+          kubectl logs \
+            -l app=site-demo \
+            --all-containers=true \
+            --tail=300
+
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+
+    needs: test
+
+    # Don't publish images from pull requests.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          docker build \
+            -t ghcr.io/${{ github.repository }}:${{ github.sha }} \
+            -t ghcr.io/${{ github.repository }}:latest \
+            ./docker_site
+
+      - name: Push image
+        run: |
+          docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository }}:latest
